@@ -1,3 +1,5 @@
 pandas
 numpy
 xmltodict
+apache-airflow-providers-microsoft-azure
+azure-storage-file-datalake
