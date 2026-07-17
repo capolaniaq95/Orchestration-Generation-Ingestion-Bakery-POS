@@ -1,12 +1,12 @@
 from airflow import DAG
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.hooks.base import BaseHook
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from datetime import datetime, timedelta
 import os
 import xmlrpc.client
 import json
-from azure.storage.filedatalake import DataLakeServiceClient
-from azure.identity import ClientSecretCredential
+import boto3
 
 default_args = {
     'owner': 'airflow',
@@ -22,7 +22,8 @@ USERNAME = os.getenv('username', 'admin')
 URL = os.getenv('url', 'http://172.23.0.1:8069/').rstrip('/')
 DB = os.getenv('db', 'panaderia')
 OUTPUT_DIR = "/opt/airflow/logs/pos_data"
-ADLS_FILESYSTEM_NAME = os.getenv('ADLS_FILESYSTEM_NAME')
+S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
+S3_PREFIX = os.getenv('S3_PREFIX', 'bakery-pos')
 
 
 def _get_odoo_models():
@@ -30,6 +31,13 @@ def _get_odoo_models():
     uid = common.authenticate(DB, USERNAME, PASSWORD, {})
     models = xmlrpc.client.ServerProxy(f"{URL}/xmlrpc/2/object")
     return DB, uid, PASSWORD, models
+
+
+def _get_run_timestamp(**kwargs):
+    logical_date = kwargs.get("logical_date")
+    if not logical_date:
+        logical_date = datetime.utcnow()
+    return logical_date.strftime("%Y%m%d%H%M%S")
 
 
 def extract_pos_orders(**kwargs):
@@ -57,8 +65,9 @@ def extract_pos_orders(**kwargs):
                     'company_id', 'amount_tax', 'amount_total', 'create_date',
                     'write_date']}
     )
-
-    orders_path = os.path.join(OUTPUT_DIR, "pos_order_records.json")
+    
+    run_ts = _get_run_timestamp(**kwargs)
+    orders_path = os.path.join(OUTPUT_DIR, f"pos_order_records_{run_ts}.json")
     with open(orders_path, "w", encoding="utf-8") as file:
         json.dump(pos_order_records, file, indent=4, ensure_ascii=False)
 
@@ -94,7 +103,8 @@ def extract_pos_order_lines(**kwargs):
                     'price_subtotal_incl', 'total_cost']}
     )
 
-    lines_path = os.path.join(OUTPUT_DIR, "pos_order_line_records.json")
+    run_ts = _get_run_timestamp(**kwargs)
+    lines_path = os.path.join(OUTPUT_DIR, f"pos_order_line_records_{run_ts}.json")
     with open(lines_path, "w", encoding="utf-8") as file:
         json.dump(pos_order_line_records, file, indent=4, ensure_ascii=False)
 
@@ -128,7 +138,8 @@ def extract_pos_payments(**kwargs):
                     'write_uid', 'name', 'payment_ref_no', 'payment_status']}
     )
 
-    payments_path = os.path.join(OUTPUT_DIR, "pos_order_payment_records.json")
+    run_ts = _get_run_timestamp(**kwargs)
+    payments_path = os.path.join(OUTPUT_DIR, f"pos_order_payment_records_{run_ts}.json")
     with open(payments_path, "w", encoding="utf-8") as file:
         json.dump(pos_order_payment_records, file, indent=4, ensure_ascii=False)
 
@@ -163,7 +174,8 @@ def extract_account_move(**kwargs):
                     'write_date']}
     )
 
-    account_move_path = os.path.join(OUTPUT_DIR, "account_move_records.json")
+    run_ts = _get_run_timestamp(**kwargs)
+    account_move_path = os.path.join(OUTPUT_DIR, f"account_move_records_{run_ts}.json")
     with open(account_move_path, "w", encoding="utf-8") as file:
         json.dump(account_move_records, file, indent=4, ensure_ascii=False)
 
@@ -201,7 +213,8 @@ def extract_account_move_line(**kwargs):
                     'price_total']}
     )
 
-    account_move_lines_path = os.path.join(OUTPUT_DIR, "account_move_line_records.json")
+    run_ts = _get_run_timestamp(**kwargs)
+    account_move_lines_path = os.path.join(OUTPUT_DIR, f"account_move_line_records_{run_ts}.json")
     with open(account_move_lines_path, "w", encoding="utf-8") as file:
         json.dump(account_move_line_records, file, indent=4, ensure_ascii=False)
 
@@ -236,7 +249,8 @@ def extract_stock_picking(**kwargs):
                     'write_date', 'create_date']}
     )
 
-    stock_picking_path = os.path.join(OUTPUT_DIR, "stock_picking_records.json")
+    run_ts = _get_run_timestamp(**kwargs)
+    stock_picking_path = os.path.join(OUTPUT_DIR, f"stock_picking_records_{run_ts}.json")
     with open(stock_picking_path, "w", encoding="utf-8") as file:
         json.dump(stock_picking_records, file, indent=4, ensure_ascii=False)
 
@@ -273,7 +287,8 @@ def extract_stock_move(**kwargs):
                     'price_unit', 'to_refund', 'create_date', 'write_date']}
     )
 
-    stock_move_path = os.path.join(OUTPUT_DIR, "stock_move_records.json")
+    run_ts = _get_run_timestamp(**kwargs)
+    stock_move_path = os.path.join(OUTPUT_DIR, f"stock_move_records_{run_ts}.json")
     with open(stock_move_path, "w", encoding="utf-8") as file:
         json.dump(stock_move_records, file, indent=4, ensure_ascii=False)
 
@@ -283,77 +298,90 @@ def extract_stock_move(**kwargs):
     }
 
 
-def upload_raw_to_adls(**kwargs):
-    ti = kwargs['ti']
-    orders_result = ti.xcom_pull(task_ids='extract_pos_orders')
-    lines_result = ti.xcom_pull(task_ids='extract_pos_order_lines')
-    payments_result = ti.xcom_pull(task_ids='extract_pos_payments')
-    account_move_result = ti.xcom_pull(task_ids='extract_account_move')
-    account_move_line_result = ti.xcom_pull(task_ids='extract_account_move_line')
-    stock_picking_result = ti.xcom_pull(task_ids='extract_stock_picking')
-    stock_move_result = ti.xcom_pull(task_ids='extract_stock_move')
+def upload_raw_to_s3(**kwargs):
+    ti = kwargs["ti"]
+    run_ts = _get_run_timestamp(**kwargs)
 
-    if not orders_result or not lines_result or not payments_result \
-       or not account_move_result or not account_move_line_result \
-       or not stock_picking_result or not stock_move_result:
-        raise ValueError("Missing data from one or more extraction tasks")
+    # 1. Consolidamos las rutas locales que vinieron de XCom
+    files_to_upload = {
+        f"pos_order_records_{run_ts}.json": ti.xcom_pull(task_ids="extract_pos_orders")[
+            "orders_path"
+        ],
+        f"pos_order_line_records_{run_ts}.json": ti.xcom_pull(
+            task_ids="extract_pos_order_lines"
+        )["lines_path"],
+        f"pos_order_payment_records_{run_ts}.json": ti.xcom_pull(
+            task_ids="extract_pos_payments"
+        )["payments_path"],
+        f"account_move_records_{run_ts}.json": ti.xcom_pull(
+            task_ids="extract_account_move"
+        )["account_move_path"],
+        f"account_move_line_records_{run_ts}.json": ti.xcom_pull(
+            task_ids="extract_account_move_line"
+        )["account_move_lines_path"],
+        f"stock_picking_records_{run_ts}.json": ti.xcom_pull(
+            task_ids="extract_stock_picking"
+        )["stock_picking_path"],
+        f"stock_move_records_{run_ts}.json": ti.xcom_pull(task_ids="extract_stock_move")[
+            "stock_move_path"
+        ],
+    }
 
-    azure_conexion = BaseHook.get_connection('azure_adls_conn')
+    # 2. Inicializamos el S3Hook usando el ID de la conexión
+    s3_hook = S3Hook(aws_conn_id="aws_s3_conn")
 
-    client_id = azure_conexion.login
-    client_secret = azure_conexion.password
-    tenant_id = azure_conexion.extra_dejson.get('tenant_id')
-    account_name = azure_conexion.extra_dejson.get('account_name', 'bakeryposadlsgen2')
-    filesystem_name = ADLS_FILESYSTEM_NAME
-
-    credential = ClientSecretCredential(
-        tenant_id=tenant_id,
-        client_id=client_id,
-        client_secret=client_secret
-    )
-
-    service_client = DataLakeServiceClient(
-        account_url=f"https://{account_name}.dfs.core.windows.net",
-        credential=credential
-    )
-
-    file_system_client = service_client.get_file_system_client(filesystem_name)
-
+    # 3. Preparamos el prefijo de fecha para S3
     now = datetime.today() + timedelta(hours=6)
-    directory_path = f"bakery_pos/{now.strftime('%Y/%m/%d')}"
+    directory_path = f"{S3_PREFIX}/{now.strftime('%Y/%m/%d')}"
 
     uploaded_files = []
-    for filename, local_path in [
-        ('pos_order_records.json', orders_result['orders_path']),
-        ('pos_order_line_records.json', lines_result['lines_path']),
-        ('pos_order_payment_records.json', payments_result['payments_path']),
-        ('account_move_records.json', account_move_result['account_move_path']),
-        ('account_move_line_records.json', account_move_line_result['account_move_lines_path']),
-        ('stock_picking_records.json', stock_picking_result['stock_picking_path']),
-        ('stock_move_records.json', stock_move_result['stock_move_path'])
-    ]:
-        file_client = file_system_client.get_file_client(f"{directory_path}/{filename}")
 
-        with open(local_path, "rb") as data:
-            file_client.upload_data(data, overwrite=True)
+    # 4. Iteramos y subimos cada archivo usando load_file
+    for filename, local_path in files_to_upload.items():
+        if not local_path:
+            raise ValueError(f"No se encontró el archivo local para {filename}")
 
-        uploaded_files.append(f"{directory_path}/{filename}")
+        # Definimos la ruta destino dentro del bucket
+        s3_key = f"{directory_path}/{filename}"
+
+        # El Hook se encarga de autenticar y subir el archivo
+        s3_hook.load_file(
+            filename=local_path,
+            key=s3_key,
+            bucket_name=S3_BUCKET_NAME,
+            replace=True,  # Si el archivo ya existe hoy, lo sobrescribe (Idempotencia)
+        )
+        uploaded_files.append(s3_key)
 
     return {
         "uploaded_files": uploaded_files,
-        "filesystem": filesystem_name,
-        "account": account_name
+        "bucket": S3_BUCKET_NAME,
+        "prefix": directory_path,
+    }
+
+
+def cleanup_pos_data(**kwargs):
+    cleaned_files = []
+    if os.path.isdir(OUTPUT_DIR):
+        for filename in os.listdir(OUTPUT_DIR):
+            file_path = os.path.join(OUTPUT_DIR, filename)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+                cleaned_files.append(filename)
+    return {
+        "cleaned_dir": OUTPUT_DIR,
+        "cleaned_files": cleaned_files,
     }
 
 
 with DAG(
-    dag_id='bakery_pos_to_adls',
+    dag_id='bakery_pos_to_s3',
     default_args=default_args,
-    description='Extract POS orders, lines and payments from Odoo and store as JSON',
+    description='Extract POS orders, lines and payments from Odoo and store as JSON in S3',
     schedule=timedelta(hours=12),
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=['bakery', 'pos', 'odoo'],
+    tags=['bakery', 'pos', 'odoo', 's3'],
 ) as dag:
     extract_pos_orders_task = PythonOperator(
         task_id='extract_pos_orders',
@@ -390,12 +418,18 @@ with DAG(
         python_callable=extract_stock_move,
     )
 
-    upload_to_adls = PythonOperator(
-        task_id='upload_raw_to_adls',
-        python_callable=upload_raw_to_adls,
+    upload_to_s3 = PythonOperator(
+        task_id='upload_raw_to_s3',
+        python_callable=upload_raw_to_s3,
+    )
+
+    cleanup_pos_data_task = PythonOperator(
+        task_id='cleanup_pos_data',
+        python_callable=cleanup_pos_data,
+        trigger_rule='all_done',
     )
 
     extract_pos_orders_task >> [extract_pos_order_lines_task, extract_pos_payments_task]
     extract_account_move_task >> extract_account_move_line_task
     extract_stock_picking_task >> extract_stock_move_task
-    [extract_pos_order_lines_task, extract_pos_payments_task, extract_account_move_line_task, extract_stock_move_task] >> upload_to_adls
+    [extract_pos_order_lines_task, extract_pos_payments_task, extract_account_move_line_task, extract_stock_move_task] >> upload_to_s3 >> cleanup_pos_data_task

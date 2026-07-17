@@ -3,3 +3,5 @@ numpy
 xmltodict
 apache-airflow-providers-microsoft-azure
 azure-storage-file-datalake
+apache-airflow-providers-amazon
+apache-airflow-providers-google
