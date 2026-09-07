@@ -2,11 +2,47 @@ from airflow import DAG
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.hooks.base import BaseHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import os
 import xmlrpc.client
 import json
 import boto3
+
+BOGOTA_TZ = ZoneInfo("America/Bogota")
+ODOO_TZ = ZoneInfo(os.getenv('ODOO_TZ', 'UTC'))
+
+
+def _get_bogota_now(**kwargs):
+    logical_date = kwargs.get("data_interval_end") or kwargs.get("logical_date")
+    if not logical_date:
+        logical_date = datetime.now(timezone.utc)
+    elif logical_date.tzinfo is None:
+        logical_date = logical_date.replace(tzinfo=timezone.utc)
+    return logical_date.astimezone(BOGOTA_TZ)
+
+
+def _get_run_timestamp(**kwargs):
+    bogota_now = _get_bogota_now(**kwargs)
+    return bogota_now.strftime("%Y%m%d%H%M%S")
+
+
+def _get_query_time_window(**kwargs):
+    bogota_now = _get_bogota_now(**kwargs)
+    bogota_start = bogota_now - timedelta(hours=4)
+    odoo_now = bogota_now.astimezone(ODOO_TZ)
+    odoo_start = bogota_start.astimezone(ODOO_TZ)
+    return odoo_start, odoo_now
+
+
+def _build_time_window_domain(field, **kwargs):
+    start, now = _get_query_time_window(**kwargs)
+    start_str = start.strftime('%Y-%m-%d %H:%M:%S')
+    now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+    return ["&",
+            [field, ">=", start_str],
+            [field, "<=", now_str]]
+
 
 default_args = {
     'owner': 'airflow',
@@ -33,28 +69,26 @@ def _get_odoo_models():
     return DB, uid, PASSWORD, models
 
 
-def _get_run_timestamp(**kwargs):
-    logical_date = kwargs.get("logical_date")
-    if not logical_date:
-        logical_date = datetime.utcnow()
-    return logical_date.strftime("%Y%m%d%H%M%S")
-
-
 def extract_pos_orders(**kwargs):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     db, uid, password, models = _get_odoo_models()
 
-    now = datetime.today() + timedelta(hours=6)
-    start = now - timedelta(hours=12)
+    domain_create = _build_time_window_domain('create_date', **kwargs)
+    domain_write = _build_time_window_domain('write_date', **kwargs)
 
-    pos_order_ids = models.execute_kw(
+    pos_order_ids_create = models.execute_kw(
         db, uid, password,
         'pos.order', 'search',
-        [["&",
-          ["create_date", ">=", start.strftime('%Y-%m-%d %H:%M:%S')],
-          ["create_date", "<=", now.strftime('%Y-%m-%d %H:%M:%S')]
-          ]],
+        [domain_create],
         {'limit': 500000})
+
+    pos_order_ids_write = models.execute_kw(
+        db, uid, password,
+        'pos.order', 'search',
+        [domain_write],
+        {'limit': 500000})
+
+    pos_order_ids = list(set(pos_order_ids_create + pos_order_ids_write))
 
     pos_order_records = models.execute_kw(
         db, uid, password,
@@ -63,7 +97,7 @@ def extract_pos_orders(**kwargs):
         {'fields': ['id', 'name', 'date_order', 'session_id', 'user_id',
                     'partner_id', 'account_move', 'state', 'pos_reference',
                     'company_id', 'amount_tax', 'amount_total', 'create_date',
-                    'write_date']}
+                    'write_date', 'write_uid']}
     )
     
     run_ts = _get_run_timestamp(**kwargs)
@@ -98,9 +132,10 @@ def extract_pos_order_lines(**kwargs):
         db, uid, password,
         'pos.order.line', 'read',
         [pos_order_line_ids],
-        {'fields': ['id', 'product_id', 'qty', 'price_unit', 'discount',
+        {'fields': ['id', 'product_id','order_id' 'qty', 'price_unit', 'discount',
                     'tax_ids_after_fiscal_position', 'price_subtotal',
-                    'price_subtotal_incl', 'total_cost']}
+                    'price_subtotal_incl', 'total_cost', 'create_date',
+                    'write_date', 'write_uid']}
     )
 
     run_ts = _get_run_timestamp(**kwargs)
@@ -135,7 +170,8 @@ def extract_pos_payments(**kwargs):
         'pos.payment', 'read',
         [pos_order_payment_ids],
         {'fields': ['id', 'pos_order_id', 'payment_method_id', 'account_move_id', 'create_uid',
-                    'write_uid', 'name', 'payment_ref_no', 'payment_status']}
+                    'write_uid', 'name', 'payment_ref_no', 'payment_status',
+                    'create_date', 'write_date']}
     )
 
     run_ts = _get_run_timestamp(**kwargs)
@@ -152,17 +188,22 @@ def extract_account_move(**kwargs):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     db, uid, password, models = _get_odoo_models()
 
-    now = datetime.today() + timedelta(hours=6)
-    start = now - timedelta(hours=12)
+    domain_create = _build_time_window_domain('create_date', **kwargs)
+    domain_write = _build_time_window_domain('write_date', **kwargs)
 
-    account_move_ids = models.execute_kw(
+    account_move_ids_create = models.execute_kw(
         db, uid, password,
         'account.move', 'search',
-        [["&",
-          ["create_date", ">=", start.strftime('%Y-%m-%d %H:%M:%S')],
-          ["create_date", "<=", now.strftime('%Y-%m-%d %H:%M:%S')]
-          ]],
+        [domain_create],
         {'limit': 500000})
+
+    account_move_ids_write = models.execute_kw(
+        db, uid, password,
+        'account.move', 'search',
+        [domain_write],
+        {'limit': 500000})
+
+    account_move_ids = list(set(account_move_ids_create + account_move_ids_write))
 
     account_move_records = models.execute_kw(
         db, uid, password,
@@ -171,7 +212,7 @@ def extract_account_move(**kwargs):
         {'fields': ['id', 'name', 'ref', 'state', 'move_type',
                     'date', 'journal_id', 'company_id', 'partner_id',
                     'payment_state', 'create_date',
-                    'write_date']}
+                    'write_date', 'write_uid']}
     )
 
     run_ts = _get_run_timestamp(**kwargs)
@@ -210,7 +251,7 @@ def extract_account_move_line(**kwargs):
                     'move_name', 'parent_state', 'ref', 'name', 'date', 'invoice_date', 
                     'analytic_distribution', 'debit', 'credit', 'balance', 'amount_currency',
                     'tax_base_amount', 'amount_residual', 'quantity', 'price_unit', 'price_subtotal',
-                    'price_total']}
+                    'price_total', 'create_date', 'write_date', 'write_uid']}
     )
 
     run_ts = _get_run_timestamp(**kwargs)
@@ -228,17 +269,22 @@ def extract_stock_picking(**kwargs):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     db, uid, password, models = _get_odoo_models()
 
-    now = datetime.today() + timedelta(hours=6)
-    start = now - timedelta(hours=12)
+    domain_create = _build_time_window_domain('create_date', **kwargs)
+    domain_write = _build_time_window_domain('write_date', **kwargs)
 
-    stock_picking_ids = models.execute_kw(
+    stock_picking_ids_create = models.execute_kw(
         db, uid, password,
         'stock.picking', 'search',
-        [["&",
-          ["create_date", ">=", start.strftime('%Y-%m-%d %H:%M:%S')],
-          ["create_date", "<=", now.strftime('%Y-%m-%d %H:%M:%S')]
-          ]],
+        [domain_create],
         {'limit': 500000})
+
+    stock_picking_ids_write = models.execute_kw(
+        db, uid, password,
+        'stock.picking', 'search',
+        [domain_write],
+        {'limit': 500000})
+
+    stock_picking_ids = list(set(stock_picking_ids_create + stock_picking_ids_write))
 
     stock_picking_records = models.execute_kw(
         db, uid, password,
@@ -246,7 +292,7 @@ def extract_stock_picking(**kwargs):
         [stock_picking_ids],
         {'fields': ['id', 'name', 'partner_id', 'picking_type_id',
                     'scheduled_date', 'date_done', 'origin', 'state',
-                    'write_date', 'create_date']}
+                    'write_date', 'create_date', 'write_uid']}
     )
 
     run_ts = _get_run_timestamp(**kwargs)
@@ -284,7 +330,8 @@ def extract_stock_move(**kwargs):
         {'fields': ['id', 'product_id', 'product_uom', 'location_id',
                     'location_dest_id', 'location_final_id', 'picking_id',
                     'name', 'priority', 'state', 'origin', 'quantity',
-                    'price_unit', 'to_refund', 'create_date', 'write_date']}
+                    'price_unit', 'to_refund', 'create_date', 'write_date',
+                    'write_uid']}
     )
 
     run_ts = _get_run_timestamp(**kwargs)
@@ -330,9 +377,9 @@ def upload_raw_to_s3(**kwargs):
     # 2. Inicializamos el S3Hook usando el ID de la conexión
     s3_hook = S3Hook(aws_conn_id="aws_s3_conn")
 
-    # 3. Preparamos el prefijo de fecha para S3
-    now = datetime.today() + timedelta(hours=6)
-    directory_path = f"{S3_PREFIX}/{now.strftime('%Y/%m/%d')}"
+    # 3. Preparamos el prefijo de fecha para S3 en hora Bogotá
+    bogota_now = _get_bogota_now(**kwargs)
+    directory_path = f"{S3_PREFIX}/{bogota_now.strftime('%Y/%m/%d')}"
 
     uploaded_files = []
 
@@ -342,7 +389,9 @@ def upload_raw_to_s3(**kwargs):
             raise ValueError(f"No se encontró el archivo local para {filename}")
 
         # Definimos la ruta destino dentro del bucket
-        s3_key = f"{directory_path}/{filename}"
+        folder = filename.split("_")[:-2]
+        directory = "_".join(folder)
+        s3_key = f"{directory_path}/{directory}/{filename}"
 
         # El Hook se encarga de autenticar y subir el archivo
         s3_hook.load_file(
@@ -378,7 +427,7 @@ with DAG(
     dag_id='bakery_pos_to_s3',
     default_args=default_args,
     description='Extract POS orders, lines and payments from Odoo and store as JSON in S3',
-    schedule=timedelta(hours=12),
+    schedule=timedelta(hours=4),
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=['bakery', 'pos', 'odoo', 's3'],
