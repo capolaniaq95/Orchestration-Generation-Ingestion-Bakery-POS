@@ -132,7 +132,7 @@ def extract_pos_order_lines(**kwargs):
         db, uid, password,
         'pos.order.line', 'read',
         [pos_order_line_ids],
-        {'fields': ['id', 'product_id','order_id' 'qty', 'price_unit', 'discount',
+        {'fields': ['id', 'product_id','order_id', 'qty', 'price_unit', 'discount',
                     'tax_ids_after_fiscal_position', 'price_subtotal',
                     'price_subtotal_incl', 'total_cost', 'create_date',
                     'write_date', 'write_uid']}
